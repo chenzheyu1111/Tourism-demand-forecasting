@@ -1,0 +1,147 @@
+import torch
+from torch import nn
+
+
+class GradNorm(nn.Module):
+    """动态调整一组损失的权重。"""
+
+    def __init__(self, n_tasks, power=1.5, eps=1e-8):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(n_tasks))
+        self.register_buffer("initial_losses", torch.full((n_tasks,), float("nan")))
+        self.power = power
+        self.eps = eps
+
+    def objective(self, losses, reference_params):
+        """
+        losses: 一维损失向量
+        reference_params: 用于测量梯度范数的模型参数
+        返回仅用于更新损失权重的GradNorm目标
+        """
+        params = tuple(reference_params)
+
+        if torch.isnan(self.initial_losses).any():
+            self.initial_losses.copy_(
+                losses.detach().clamp_min(self.eps)
+            )
+
+        # 未加权损失对参考参数的梯度范数
+        norms = []
+        for loss in losses:
+            grads = torch.autograd.grad(
+                loss, params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            grads = [g.detach() for g in grads if g is not None]
+            if not grads:
+                raise ValueError("参考参数与某项损失不存在计算依赖。")
+
+            norms.append(
+                torch.stack([g.square().sum() for g in grads]).sum().sqrt()
+            )
+
+        # 正权重下：||∇(w_i L_i)|| = w_i ||∇L_i||
+        gradient_norms = self.weights * torch.stack(norms)
+
+        loss_ratios = losses.detach() / self.initial_losses
+        relative_rates = loss_ratios / loss_ratios.mean().clamp_min(self.eps)
+
+        target_norms = (
+            gradient_norms.detach().mean()
+            * relative_rates.pow(self.power)
+        ).detach()
+
+        return (gradient_norms - target_norms).abs().sum()
+
+    @torch.no_grad()
+    def normalize_(self):
+        """保持权重为正，并使权重之和等于任务数。"""
+        self.weights.clamp_(min=self.eps)
+        self.weights.mul_(self.weights.numel() / self.weights.sum())
+
+
+class CompleteLoss(nn.Module):
+
+    def __init__(self, quantiles=None, power=1.5, eps=1e-8):
+        super().__init__()
+        self.quantiles = None if quantiles is None else tuple(quantiles)
+        self.eps = eps
+
+        self.gamma = GradNorm(3, power, eps) 
+        self.beta = GradNorm(3, power, eps)
+        self.alpha = GradNorm(2, power, eps)
+
+    def forward(self, demand_pred, demand_true, ppm_pred, ppm_true):
+        if self.quantiles is None:
+            primary_loss = (demand_pred - demand_true).square().mean()
+            point_pred = demand_pred
+        else:
+            q = demand_pred.new_tensor(self.quantiles)
+            residual = demand_true.unsqueeze(-1) - demand_pred
+
+            primary_loss = torch.maximum(
+                q * residual, (q - 1) * residual
+            ).mean()
+
+            median_index = self.quantiles.index(0.5)
+            point_pred = demand_pred[..., median_index]
+
+        ppm_losses = torch.stack([
+            (ppm_pred[..., k] - ppm_true[..., k]).square().mean()
+            for k in range(3)
+        ])
+
+        theory_loss = (
+            self.gamma.weights.detach().clone() * ppm_losses
+        ).sum()
+
+        # 3. 误差统计损失：公式(24)，区间版对应公式(26)
+        y = demand_true.reshape(-1)
+        p = point_pred.reshape(-1)
+
+        mean_y, mean_p = y.mean(), p.mean()
+        std_y = y.std(correction=0)  # 总体标准差
+        std_p = p.std(correction=0)
+
+        covariance = ((y - mean_y) * (p - mean_p)).mean()
+        correlation = covariance / (std_y * std_p + self.eps)
+        correlation = correlation.clamp(-1, 1)
+
+        error_losses = torch.stack([
+            1 - correlation,
+            (std_p / (std_y + self.eps) - 1).square(),
+            (mean_p - mean_y).square(),
+        ])
+
+        error_loss = (
+            self.beta.weights.detach().clone() * error_losses
+        ).sum()
+
+        auxiliary_losses = torch.stack([theory_loss, error_loss])
+
+        total_loss = primary_loss + (
+            self.alpha.weights.detach().clone() * auxiliary_losses
+        ).sum()
+
+        parts = {
+            "gamma": ppm_losses,
+            "beta": error_losses,
+            "alpha": auxiliary_losses,
+        }
+        return total_loss, parts
+
+    def gradnorm_loss(self, parts, reference_params):
+        """三组权重分别计算GradNorm更新目标。"""
+        params = tuple(reference_params)
+        return (
+            self.gamma.objective(parts["gamma"], params)
+            + self.beta.objective(parts["beta"], params)
+            + self.alpha.objective(parts["alpha"], params)
+        )
+
+    @torch.no_grad()
+    def normalize_weights_(self):
+        self.gamma.normalize_()  # γ之和为3
+        self.beta.normalize_()   # β之和为3
+        self.alpha.normalize_()  # α之和为2
